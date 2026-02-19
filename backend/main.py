@@ -1,22 +1,15 @@
-import re
-import io
-import pytesseract
+import os
+import uuid
+import pdfplumber
 import pandas as pd
-
-from typing import List
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pdf2image import convert_from_bytes
-from PyPDF2 import PdfReader
+from fastapi.responses import FileResponse
+from openai import OpenAI
 
-# ----------------------------
-# CREATE FASTAPI APP
-# ----------------------------
-app = FastAPI(title="Financial Research Tool API")
+app = FastAPI()
 
-# ----------------------------
-# ENABLE CORS (important for frontend)
-# ----------------------------
+# Allow frontend requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,85 +18,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
-# FINANCIAL KEYWORDS LIST
-# ----------------------------
-FINANCIAL_KEYWORDS = [
-    "Revenue", "Net Revenue", "Sales",
-    "Profit", "Net Profit", "Loss",
-    "EBITDA", "Operating Income",
-    "Expenses", "Total Assets",
-    "Total Liabilities", "Equity",
-    "Cash Flow", "Gross Profit"
+# OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Financial Keywords
+KEYWORDS = [
+    "revenue", "profit", "loss", "income", "expenses",
+    "assets", "liabilities", "equity", "cash flow",
+    "operating income", "net income", "gross profit",
+    "ebitda", "tax", "debt"
 ]
 
-# ----------------------------
-# ROOT ROUTE
-# ----------------------------
+
 @app.get("/")
 def home():
-    return {"message": "Financial Research Tool Backend Running 🚀"}
+    return {"status": "Financial Research Tool Backend Running"}
 
-# ----------------------------
-# DOCUMENT UPLOAD + RESEARCH TOOL
-# ----------------------------
+
 @app.post("/extract")
-async def extract_documents(files: List[UploadFile] = File(...)):
-
-    all_results = []
+async def extract(files: list[UploadFile] = File(...)):
+    results = []
 
     for file in files:
-        contents = await file.read()
+        file_id = str(uuid.uuid4())
+        file_path = f"temp_{file_id}.pdf"
+
+        # Save uploaded file
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+
+        # Extract text using pdfplumber (NO OCR)
         text = ""
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
 
-        # -------- NORMAL PDF TEXT EXTRACTION --------
-        try:
-            reader = PdfReader(io.BytesIO(contents))
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-        except:
-            pass
+        os.remove(file_path)
 
-        # -------- OCR FALLBACK --------
-        if len(text.strip()) < 50:
-            try:
-                images = convert_from_bytes(contents)
-                for img in images:
-                    text += pytesseract.image_to_string(img)
-            except:
-                pass
+        # Filter text for financial keywords
+        filtered_text = "\n".join(
+            [line for line in text.split("\n")
+             if any(keyword.lower() in line.lower() for keyword in KEYWORDS)]
+        )
 
-        # -------- KEYWORD EXTRACTION --------
-        file_data = []
+        # Ask OpenAI to structure data
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Extract financial line items and numbers into structured JSON."},
+                {"role": "user", "content": filtered_text}
+            ]
+        )
 
-        for keyword in FINANCIAL_KEYWORDS:
-            pattern = rf"{keyword}\s*[:\-]?\s*([\d,]+)"
-            matches = re.findall(pattern, text, re.IGNORECASE)
+        structured_data = response.choices[0].message.content
 
-            if matches:
-                for value in matches:
-                    file_data.append({
-                        "keyword": keyword,
-                        "value": value
-                    })
-
-        # -------- HANDLE MISSING DATA --------
-        if not file_data:
-            file_data.append({
-                "keyword": "No financial keywords found",
-                "value": "N/A"
-            })
-
-        all_results.append({
-            "file_name": file.filename,
-            "extracted_data": file_data
+        results.append({
+            "filename": file.filename,
+            "extracted_data": structured_data
         })
 
-    # -------- CLEAN STRUCTURED RESPONSE --------
-    return {
-        "status": "success",
-        "total_files_processed": len(files),
-        "results": all_results
-    }
+    # Convert to DataFrame
+    df = pd.DataFrame(results)
+
+    o
